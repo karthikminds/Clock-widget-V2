@@ -1,0 +1,647 @@
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.example.notesclock"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.example.notesclock"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+          dependencies {
+              implementation("androidx.glance:glance-appwidget:1.1.0")
+              implementation("androidx.activity:activity-ktx:1.9.2")
+              implementation("androidx.health.connect:connect-client:1.1.0-alpha10")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.health.READ_STEPS" />
+              <queries><package android:name="com.google.android.apps.healthdata" /></queries>
+              <application android:label="Notes Clock Widget" android:theme="@android:style/Theme.DeviceDefault">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
+                      </intent-filter>
+                  </activity>
+                  <activity-alias android:name="ViewPermissionUsageActivity" android:exported="true"
+                      android:targetActivity=".MainActivity" android:permission="android.permission.START_VIEW_PERMISSION_USAGE">
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW_PERMISSION_USAGE" />
+                          <category android:name="android.intent.category.HEALTH_PERMISSIONS" />
+                      </intent-filter>
+                  </activity-alias>
+                  <activity android:name=".EditNotesActivity" android:exported="false"
+                      android:theme="@android:style/Theme.DeviceDefault.Dialog" android:windowSoftInputMode="adjustResize" />
+                  <receiver android:name=".NotesWidgetReceiver" android:exported="true" android:label="Notes Clock 4x2">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                          <action android:name="android.intent.action.DATE_CHANGED" />
+                          <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                          <action android:name="android.intent.action.TIME_SET" />
+                      </intent-filter>
+                      <meta-data android:name="android.appwidget.provider" android:resource="@xml/widget_info" />
+                  </receiver>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/com/example/notesclock/EditNotesActivity.kt)"
+          cat > app/src/main/java/com/example/notesclock/EditNotesActivity.kt <<'EOF_FILE'
+          package com.example.notesclock
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.text.InputFilter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.glance.appwidget.updateAll
+          import kotlinx.coroutines.MainScope
+          import kotlinx.coroutines.launch
+          import java.time.format.DateTimeFormatter
+
+          class EditNotesActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val d = Store.view(this).sel
+                  val n = Store.notes(this, d)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  val title = TextView(this).apply {
+                      text = "Notes \u2022 " + d.format(DateTimeFormatter.ofPattern("EEE, MMM d"))
+                      textSize = 17f
+                  }
+                  fun field(v: String, h: String) = EditText(this).apply {
+                      setText(v)
+                      hint = h
+                      setSingleLine()
+                      filters = arrayOf(InputFilter.LengthFilter(28))
+                  }
+                  val a = field(n.a, "Note 1")
+                  val b = field(n.b, "Note 2")
+                  val save = Button(this).apply {
+                      text = "Save"
+                      setOnClickListener {
+                          Store.setNotes(this@EditNotesActivity, d, a.text.toString(), b.text.toString())
+                          MainScope().launch {
+                              NotesWidget().updateAll(applicationContext)
+                              finish()
+                          }
+                      }
+                  }
+                  root.addView(title)
+                  root.addView(a)
+                  root.addView(b)
+                  root.addView(save)
+                  setContentView(root)
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/com/example/notesclock/MainActivity.kt)"
+          cat > app/src/main/java/com/example/notesclock/MainActivity.kt <<'EOF_FILE'
+          package com.example.notesclock
+
+          import android.os.Bundle
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+          import androidx.glance.appwidget.updateAll
+          import androidx.health.connect.client.PermissionController
+          import kotlinx.coroutines.MainScope
+          import kotlinx.coroutines.launch
+
+          class MainActivity : ComponentActivity() {
+              private lateinit var status: TextView
+
+              private val reqPerm = registerForActivityResult(PermissionController.createRequestPermissionResultContract()) {
+                  MainScope().launch { sync() }
+              }
+
+              private suspend fun sync(): Boolean {
+                  val s = Steps.readToday(this)
+                  return if (s != null) {
+                      Store.setSteps(this, s)
+                      NotesWidget().updateAll(this)
+                      status.text = "Steps today: %,d (synced)".format(s)
+                      true
+                  } else {
+                      status.text = if (Steps.available(this)) "No step access yet. Tap \"Allow step access\"." else "Health Connect is not available on this phone."
+                      false
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+                  fun label(t: String, size: Float = 14f) = TextView(this).apply { text = t; textSize = size; setPadding(0, pad / 2, 0, pad / 4) }
+                  fun button(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+                  status = label("")
+                  val goal = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText(Store.goal(this@MainActivity).toString())
+                  }
+                  root.addView(label("Notes Clock Widget", 22f))
+                  root.addView(label("Add it: long-press the home screen \u2192 Widgets \u2192 Notes Clock Widget, then place the 4\u00D72 widget."))
+                  root.addView(label("Steps come from Health Connect. In Samsung Health, connect it to Health Connect and allow Steps, then:"))
+                  root.addView(button("Allow step access") {
+                      if (Steps.available(this)) {
+                          reqPerm.launch(setOf(Steps.permission))
+                      } else {
+                          status.text = "Health Connect is not available on this phone."
+                      }
+                  })
+                  root.addView(button("Sync steps now") { MainScope().launch { sync() } })
+                  root.addView(status)
+                  root.addView(label("Daily step goal"))
+                  root.addView(goal)
+                  root.addView(button("Save goal") {
+                      Store.setGoal(this, goal.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 10000)
+                      MainScope().launch { NotesWidget().updateAll(applicationContext) }
+                  })
+                  root.addView(label("Widget tips: tap a date to see its notes, tap a note to edit, tap the circle to tick it, tap the steps line to sync."))
+                  setContentView(ScrollView(this).apply { addView(root) })
+                  if (intent.getBooleanExtra("sync", false)) {
+                      MainScope().launch { if (sync()) finish() }
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/com/example/notesclock/NotesWidget.kt)"
+          cat > app/src/main/java/com/example/notesclock/NotesWidget.kt <<'EOF_FILE'
+          package com.example.notesclock
+
+          import android.content.Context
+          import android.content.Intent
+          import android.widget.RemoteViews
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.glance.GlanceId
+          import androidx.glance.GlanceModifier
+          import androidx.glance.action.ActionParameters
+          import androidx.glance.action.actionParametersOf
+          import androidx.glance.action.clickable
+          import androidx.glance.appwidget.AndroidRemoteViews
+          import androidx.glance.appwidget.GlanceAppWidget
+          import androidx.glance.appwidget.GlanceAppWidgetReceiver
+          import androidx.glance.appwidget.LinearProgressIndicator
+          import androidx.glance.appwidget.SizeMode
+          import androidx.glance.appwidget.action.ActionCallback
+          import androidx.glance.appwidget.action.actionRunCallback
+          import androidx.glance.appwidget.action.actionStartActivity
+          import androidx.glance.appwidget.cornerRadius
+          import androidx.glance.appwidget.provideContent
+          import androidx.glance.appwidget.update
+          import androidx.glance.appwidget.updateAll
+          import androidx.glance.background
+          import androidx.glance.layout.Alignment
+          import androidx.glance.layout.Box
+          import androidx.glance.layout.Column
+          import androidx.glance.layout.Row
+          import androidx.glance.layout.RowScope
+          import androidx.glance.layout.Spacer
+          import androidx.glance.layout.fillMaxHeight
+          import androidx.glance.layout.fillMaxSize
+          import androidx.glance.layout.fillMaxWidth
+          import androidx.glance.layout.height
+          import androidx.glance.layout.padding
+          import androidx.glance.layout.size
+          import androidx.glance.layout.width
+          import androidx.glance.text.FontWeight
+          import androidx.glance.text.Text
+          import androidx.glance.text.TextDecoration
+          import androidx.glance.text.TextStyle
+          import androidx.glance.unit.ColorProvider
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import java.time.LocalDate
+          import java.time.YearMonth
+          import java.time.format.DateTimeFormatter
+          import java.util.Locale
+
+          private val BG = Color(0xF2191A1F)
+          private val FG = Color(0xFFEEF2F7)
+          private val MUT = Color(0xFF9AA8BB)
+          private val ACC = Color(0xFF38BDF8)
+          private val SELBG = Color(0x4038BDF8)
+          private val CARD = Color(0x16FFFFFF)
+          private val LINE = Color(0x1FFFFFFF)
+
+          val DateKey = ActionParameters.Key<String>("d")
+          val WhichKey = ActionParameters.Key<String>("w")
+          val DeltaKey = ActionParameters.Key<Int>("m")
+
+          private fun cp(c: Color) = ColorProvider(c)
+
+          class NotesWidget : GlanceAppWidget() {
+              override val sizeMode = SizeMode.Single
+
+              override suspend fun provideGlance(context: Context, id: GlanceId) {
+                  val steps = Steps.readToday(context)?.also { Store.setSteps(context, it) } ?: Store.steps(context)
+                  provideContent { Body(context, steps) }
+              }
+          }
+
+          @Composable
+          private fun Body(ctx: Context, steps: Long) {
+              val nav = Store.view(ctx)
+              val today = Store.today()
+              val goal = Store.goal(ctx).coerceAtLeast(1)
+              val n = Store.notes(ctx, nav.sel)
+              val isToday = nav.sel == today
+              val dateText = if (isToday) today.format(DateTimeFormatter.ofPattern("EEEE, MMM d"))
+              else nav.sel.format(DateTimeFormatter.ofPattern("EEE, MMM d")) + " \u21A9"
+              val syncIntent = Intent(ctx, MainActivity::class.java).putExtra("sync", true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+              Column(
+                  GlanceModifier.fillMaxSize().background(cp(BG)).cornerRadius(26.dp)
+                      .padding(horizontal = 14.dp, vertical = 12.dp)
+              ) {
+                  Row(GlanceModifier.fillMaxWidth().defaultWeight()) {
+                      Column(GlanceModifier.defaultWeight().fillMaxHeight()) {
+                          AndroidRemoteViews(RemoteViews(ctx.packageName, R.layout.clock_view))
+                          Text(
+                              dateText, maxLines = 1,
+                              style = TextStyle(color = cp(if (isToday) MUT else ACC), fontSize = 11.sp),
+                              modifier = GlanceModifier.padding(top = 4.dp).clickable(actionRunCallback<TodayAction>())
+                          )
+                          Spacer(GlanceModifier.defaultWeight())
+                          Text(
+                              "%,d / %,d steps".format(steps, goal), maxLines = 1,
+                              style = TextStyle(color = cp(FG), fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                              modifier = GlanceModifier.clickable(actionStartActivity(syncIntent))
+                          )
+                          Spacer(GlanceModifier.height(4.dp))
+                          LinearProgressIndicator(
+                              progress = (steps.toFloat() / goal).coerceIn(0f, 1f),
+                              modifier = GlanceModifier.fillMaxWidth(),
+                              color = cp(ACC), backgroundColor = cp(CARD)
+                          )
+                      }
+                      Spacer(GlanceModifier.width(8.dp))
+                      Spacer(GlanceModifier.width(1.dp).fillMaxHeight().background(cp(LINE)))
+                      Column(GlanceModifier.width(176.dp).fillMaxHeight().padding(start = 8.dp)) {
+                          Calendar(ctx, nav.month, today, nav.sel)
+                      }
+                  }
+                  Spacer(GlanceModifier.height(8.dp))
+                  Row(GlanceModifier.fillMaxWidth()) {
+                      NoteCard(nav.sel, "a", n.a, n.ad)
+                      Spacer(GlanceModifier.width(8.dp))
+                      NoteCard(nav.sel, "b", n.b, n.bd)
+                  }
+              }
+          }
+
+          @Composable
+          private fun Calendar(ctx: Context, ym: YearMonth, today: LocalDate, sel: LocalDate) {
+              val first = ym.atDay(1).dayOfWeek.value % 7
+              val len = ym.lengthOfMonth()
+              val label = ym.month.getDisplayName(java.time.format.TextStyle.SHORT, Locale.getDefault()).uppercase() + " " + ym.year
+              Row(GlanceModifier.fillMaxWidth().height(15.dp), verticalAlignment = Alignment.CenterVertically) {
+                  Text(label, style = TextStyle(color = cp(FG), fontSize = 10.sp, fontWeight = FontWeight.Bold), modifier = GlanceModifier.defaultWeight())
+                  Text("\u2039", style = TextStyle(color = cp(MUT), fontSize = 13.sp), modifier = GlanceModifier.padding(horizontal = 5.dp).clickable(actionRunCallback<MonthAction>(actionParametersOf(DeltaKey to -1))))
+                  Text("\u2022", style = TextStyle(color = cp(MUT), fontSize = 11.sp), modifier = GlanceModifier.padding(horizontal = 3.dp).clickable(actionRunCallback<TodayAction>()))
+                  Text("\u203A", style = TextStyle(color = cp(MUT), fontSize = 13.sp), modifier = GlanceModifier.padding(horizontal = 5.dp).clickable(actionRunCallback<MonthAction>(actionParametersOf(DeltaKey to 1))))
+              }
+              Row(GlanceModifier.fillMaxWidth().height(13.dp)) {
+                  for (ch in "SMTWTFS") {
+                      Box(GlanceModifier.width(24.dp), contentAlignment = Alignment.Center) {
+                          Text(ch.toString(), style = TextStyle(color = cp(MUT), fontSize = 8.sp))
+                      }
+                  }
+              }
+              val rows = (first + len + 6) / 7
+              for (r in 0 until rows) {
+                  Row(GlanceModifier.fillMaxWidth()) {
+                      for (c in 0..6) {
+                          val day = r * 7 + c - first + 1
+                          if (day in 1..len) Day(ctx, ym.atDay(day), today, sel)
+                          else Spacer(GlanceModifier.size(24.dp, 17.dp))
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Day(ctx: Context, d: LocalDate, today: LocalDate, sel: LocalDate) {
+              val isT = d == today
+              val isS = d == sel
+              val has = Store.has(ctx, d)
+              var m = GlanceModifier.size(17.dp)
+              if (isT) m = m.background(cp(ACC)).cornerRadius(9.dp)
+              else if (isS) m = m.background(cp(SELBG)).cornerRadius(9.dp)
+              Box(
+                  GlanceModifier.size(24.dp, 17.dp).clickable(actionRunCallback<SelectAction>(actionParametersOf(DateKey to d.toString()))),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Box(m, contentAlignment = Alignment.Center) {
+                      Text(
+                          d.dayOfMonth.toString(),
+                          style = TextStyle(
+                              color = cp(if (isT) Color(0xFF0A0A0A) else if (has) ACC else FG),
+                              fontSize = 10.sp,
+                              fontWeight = if (isT || isS || has) FontWeight.Bold else FontWeight.Normal
+                          )
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun RowScope.NoteCard(date: LocalDate, which: String, text: String, done: Boolean) {
+              val ctx = androidx.glance.LocalContext.current
+              val edit = Intent(ctx, EditNotesActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+              Row(
+                  GlanceModifier.defaultWeight().height(32.dp).background(cp(CARD)).cornerRadius(12.dp).padding(horizontal = 9.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(
+                      if (done) "\u2713" else "\u25CB",
+                      style = TextStyle(color = cp(if (done) ACC else MUT), fontSize = 13.sp),
+                      modifier = GlanceModifier.padding(end = 6.dp).clickable(
+                          actionRunCallback<DoneAction>(actionParametersOf(DateKey to date.toString(), WhichKey to which))
+                      )
+                  )
+                  Text(
+                      if (text.isBlank()) "Add note\u2026" else text, maxLines = 1,
+                      style = TextStyle(
+                          color = cp(if (text.isBlank()) MUT else FG), fontSize = 11.sp,
+                          textDecoration = if (done) TextDecoration.LineThrough else TextDecoration.None
+                      ),
+                      modifier = GlanceModifier.defaultWeight().clickable(actionStartActivity(edit))
+                  )
+              }
+          }
+
+          class SelectAction : ActionCallback {
+              override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
+                  val d = LocalDate.parse(parameters[DateKey]!!)
+                  Store.setView(context, d, Store.view(context).month)
+                  NotesWidget().update(context, glanceId)
+              }
+          }
+
+          class TodayAction : ActionCallback {
+              override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
+                  Store.setView(context, Store.today(), YearMonth.now())
+                  NotesWidget().update(context, glanceId)
+              }
+          }
+
+          class MonthAction : ActionCallback {
+              override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
+                  val v = Store.view(context)
+                  Store.setView(context, v.sel, v.month.plusMonths((parameters[DeltaKey] ?: 0).toLong()))
+                  NotesWidget().update(context, glanceId)
+              }
+          }
+
+          class DoneAction : ActionCallback {
+              override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
+                  Store.toggle(context, LocalDate.parse(parameters[DateKey]!!), parameters[WhichKey] ?: "a")
+                  NotesWidget().update(context, glanceId)
+              }
+          }
+
+          class NotesWidgetReceiver : GlanceAppWidgetReceiver() {
+              override val glanceAppWidget: GlanceAppWidget = NotesWidget()
+
+              override fun onReceive(context: Context, intent: Intent) {
+                  super.onReceive(context, intent)
+                  if (intent.action == Intent.ACTION_DATE_CHANGED || intent.action == Intent.ACTION_TIMEZONE_CHANGED || intent.action == Intent.ACTION_TIME_CHANGED) {
+                      val pending = goAsync()
+                      CoroutineScope(Dispatchers.Default).launch {
+                          try { NotesWidget().updateAll(context) } finally { pending.finish() }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/com/example/notesclock/Steps.kt)"
+          cat > app/src/main/java/com/example/notesclock/Steps.kt <<'EOF_FILE'
+          package com.example.notesclock
+
+          import android.content.Context
+          import androidx.health.connect.client.HealthConnectClient
+          import androidx.health.connect.client.permission.HealthPermission
+          import androidx.health.connect.client.records.StepsRecord
+          import androidx.health.connect.client.request.AggregateRequest
+          import androidx.health.connect.client.time.TimeRangeFilter
+          import java.time.Instant
+          import java.time.LocalDate
+          import java.time.ZoneId
+
+          object Steps {
+              val permission = HealthPermission.getReadPermission(StepsRecord::class)
+
+              fun available(c: Context) = HealthConnectClient.getSdkStatus(c) == HealthConnectClient.SDK_AVAILABLE
+
+              suspend fun readToday(c: Context): Long? {
+                  return try {
+                      if (!available(c)) return null
+                      val client = HealthConnectClient.getOrCreate(c)
+                      if (permission !in client.permissionController.getGrantedPermissions()) return null
+                      val start = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant()
+                      val res = client.aggregate(
+                          AggregateRequest(setOf(StepsRecord.COUNT_TOTAL), TimeRangeFilter.between(start, Instant.now()))
+                      )
+                      res[StepsRecord.COUNT_TOTAL] ?: 0L
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/java/com/example/notesclock/Store.kt)"
+          cat > app/src/main/java/com/example/notesclock/Store.kt <<'EOF_FILE'
+          package com.example.notesclock
+
+          import android.content.Context
+          import java.time.LocalDate
+          import java.time.YearMonth
+
+          object Store {
+              class Notes(val a: String, val ad: Boolean, val b: String, val bd: Boolean)
+              class Nav(val sel: LocalDate, val month: YearMonth)
+
+              private fun p(c: Context) = c.getSharedPreferences("w", Context.MODE_PRIVATE)
+              fun today(): LocalDate = LocalDate.now()
+
+              fun view(c: Context): Nav {
+                  val s = p(c)
+                  val t = today()
+                  if (s.getString("selDay", "") != t.toString()) return Nav(t, YearMonth.from(t))
+                  val sel = runCatching { LocalDate.parse(s.getString("sel", "")) }.getOrDefault(t)
+                  return Nav(sel, YearMonth.of(s.getInt("cy", t.year), s.getInt("cm", t.monthValue)))
+              }
+
+              fun setView(c: Context, sel: LocalDate, ym: YearMonth) {
+                  p(c).edit().putString("sel", sel.toString()).putString("selDay", today().toString())
+                      .putInt("cy", ym.year).putInt("cm", ym.monthValue).apply()
+              }
+
+              fun notes(c: Context, d: LocalDate): Notes {
+                  val s = p(c)
+                  return Notes(
+                      s.getString("n_${d}_a", "") ?: "", s.getBoolean("n_${d}_ad", false),
+                      s.getString("n_${d}_b", "") ?: "", s.getBoolean("n_${d}_bd", false)
+                  )
+              }
+
+              fun has(c: Context, d: LocalDate): Boolean {
+                  val n = notes(c, d)
+                  return n.a.isNotBlank() || n.b.isNotBlank()
+              }
+
+              fun setNotes(c: Context, d: LocalDate, a: String, b: String) {
+                  p(c).edit().putString("n_${d}_a", a.trim()).putString("n_${d}_b", b.trim()).apply()
+              }
+
+              fun toggle(c: Context, d: LocalDate, which: String) {
+                  val k = "n_${d}_${which}d"
+                  p(c).edit().putBoolean(k, !p(c).getBoolean(k, false)).apply()
+              }
+
+              fun steps(c: Context): Long = p(c).getLong("steps", 0L)
+              fun setSteps(c: Context, v: Long) = p(c).edit().putLong("steps", v).apply()
+              fun goal(c: Context): Int = p(c).getInt("goal", 10000)
+              fun setGoal(c: Context, v: Int) = p(c).edit().putInt("goal", v).apply()
+          }
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/res/layout/clock_view.xml)"
+          cat > app/src/main/res/layout/clock_view.xml <<'EOF_FILE'
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="wrap_content"
+              android:layout_height="wrap_content"
+              android:gravity="bottom"
+              android:orientation="horizontal">
+              <TextClock
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:fontFamily="sans-serif-condensed"
+                  android:format12Hour="hh:mm"
+                  android:format24Hour="HH:mm"
+                  android:includeFontPadding="false"
+                  android:textColor="#C4B5FD"
+                  android:textSize="46sp"
+                  android:textStyle="bold" />
+              <TextClock
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:fontFamily="sans-serif-condensed"
+                  android:format12Hour=":ss"
+                  android:format24Hour=":ss"
+                  android:includeFontPadding="false"
+                  android:textColor="#B0A3D9"
+                  android:textSize="20sp" />
+              <TextClock
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginStart="4dp"
+                  android:format12Hour="a"
+                  android:format24Hour="a"
+                  android:includeFontPadding="false"
+                  android:textColor="#9AA8BB"
+                  android:textSize="9sp" />
+          </LinearLayout>
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/res/values/strings.xml)"
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="widget_desc">Clock, calendar, date notes and steps</string>
+          </resources>
+          EOF_FILE
+          mkdir -p "$(dirname app/src/main/res/xml/widget_info.xml)"
+          cat > app/src/main/res/xml/widget_info.xml <<'EOF_FILE'
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp"
+              android:minHeight="110dp"
+              android:targetCellWidth="4"
+              android:targetCellHeight="2"
+              android:minResizeWidth="180dp"
+              android:minResizeHeight="110dp"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="1800000"
+              android:widgetCategory="home_screen"
+              android:description="@string/widget_desc"
+              android:initialLayout="@layout/glance_default_loading_layout" />
+          EOF_FILE
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.6.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          EOF_FILE
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          EOF_FILE
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "NotesClockWidget"
+          include(":app")
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notes-clock-widget-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
